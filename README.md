@@ -55,3 +55,21 @@ docker compose up --build
 **Secrets.** Nothing is hardcoded in the application: `backend/src/db.js` has no password default and fails fast if no credentials are provided. The values in `docker-compose.yml` are local-development defaults; override them with a `.env` file (`cp .env.example .env`, which is git-ignored).
 
 **Networking.** Services reach each other by service name on the Compose network (`postgres`, `redis`, `search`); `depends_on` with health checks makes the backend start only once Postgres accepts connections.
+
+## Task 2: Kubernetes
+
+```bash
+./scripts/setup-kind.sh      # creates the cluster, builds + loads images, applies the manifests
+# or manually, on an existing kind/minikube cluster with the images loaded:
+kubectl apply -f k8s/namespace-dev.yaml
+kubectl apply -n dev -f k8s/
+kubectl get all -n dev
+```
+
+- The `dev` namespace holds every application resource.
+- `backend-service` and `postgres-service` are `ClusterIP`: internal only.
+- `frontend-service` is `NodePort` 30080 for direct access (http://localhost:30080 on kind); Task 3 adds the Ingress on top.
+- Postgres stores its data on a `PersistentVolumeClaim` bound to a `hostPath` `PersistentVolume`, so data survives pod restarts. The Deployment uses `strategy: Recreate` because the volume is ReadWriteOnce, and `PGDATA` points to a sub-directory to avoid the `lost+found` init error.
+- Configuration: non-secret settings in the `app-config` ConfigMap, credentials in the `app-secrets` Secret (dev-only placeholders; see Task 4 for other environments).
+- `backend` has a `readinessProbe` on `/api/health/ready` (checks the database is reachable) and a `livenessProbe` on `/api/health/live` (process only), so a database outage stops traffic to a pod instead of restart-looping it.
+- Images use the names `ghcr.io/<owner>/...-backend|frontend`. The setup script builds them locally and loads them into kind (`kind load docker-image`); the pipeline replaces the tag with the one it just pushed.
