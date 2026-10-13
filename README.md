@@ -154,3 +154,22 @@ One-time GitHub setup: Settings, Environments, create `dev`, `preprod`, `release
 - Automatic: if a rollout does not become healthy, the last deploy step runs `kubectl rollout undo` on the deployments.
 - Manual, fast: Actions, CI/CD, Run workflow, enter the namespace (the `rollback` job), or `kubectl -n <ns> rollout undo deployment/backend [--to-revision=N]`; `kubectl rollout history` lists revisions.
 - Precise: every image tag is immutable (`<branch>-<sha>`), so re-running the pipeline on a previous commit redeploys exactly that known-good image, without depending on an old ReplicaSet still existing.
+
+## Task 5: Platform services (Redis, queue, search, read/write DB)
+
+Added to both `docker-compose.yml` and `k8s/`. All of them are internal (`ClusterIP`, no published ports in Kubernetes); `k8s/network-policies.yaml` restricts who may connect to them (enforced when the CNI supports NetworkPolicy, such as Calico or Cilium; kind's default CNI ignores them).
+
+| Service | Files | How the backend uses it |
+|---|---|---|
+| Redis | `redis-deployment.yaml`, `redis-service.yaml` (`maxmemory-policy noeviction`, required by BullMQ) | `REDIS_URL`; `GET /api/health/redis` |
+| Queue (BullMQ over Redis) | `bullmq-worker-deployment.yaml` | every `POST /api/items` enqueues an `item-created` job (`backend/src/queue.js`); a separate worker process (`backend/src/worker.js`, same image, different `command`) consumes it, so it scales and fails independently of the API |
+| Search (OpenSearch, single node, security plugin disabled, dev only) | `search-deployment.yaml`, `search-service.yaml` | `SEARCH_URL`; `GET /api/health/search` (health call only; real indexing would hook into the queue consumer) |
+| Read/write DB | `DB_WRITE_URL` and `DB_READ_URL` | `backend/src/db.js` keeps two pools: `write()` always uses the writer, `read()` uses the reader |
+
+Quick checks (Compose): `curl localhost:4000/api/health/redis`, `curl localhost:4000/api/health/search`, add an item and watch `docker compose logs worker`. In Kubernetes: `kubectl -n dev logs deploy/bullmq-worker`.
+
+**Simulated cluster.** Locally the "primary" and "replica" are the same Postgres instance behind two endpoints (`postgres` and the alias `postgres-replica` in Compose; `postgres-service` and `postgres-read-service` in Kubernetes). The code already treats them as separate targets, so pointing `DB_READ_URL` at a real replica later is a configuration-only change.
+
+**Where routing logic lives.** Here it is explicit in application code (`write()` vs `read()`). The alternative is a DB proxy (PgBouncer, Pgpool-II, a managed reader endpoint) that makes routing transparent to the app: simpler code, but one more component to operate and one more hop of latency.
+
+**Replication lag.** A replica can be milliseconds to seconds behind the primary. Operations that must always hit the writer: all writes; reads that must see data just written (read-your-writes, for example re-fetching a record right after creating it); reads inside a transaction that also writes; reads that drive a write decision (uniqueness checks, balance checks, locks, idempotency keys); and auth/session reads right after login or a password change. Lists, dashboards and search tolerate seconds-old data and can use replicas. Mitigations: monitor lag, fall back to the primary when lag is high, or pin a user's reads to the primary for a few seconds after they write.
