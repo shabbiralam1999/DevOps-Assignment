@@ -7,13 +7,14 @@
   "scripts": {
     "start": "node src/index.js",
     "worker": "node src/worker.js",
-    "test": "node --test test/ || true"
+    "test": "node --test"
   },
   "dependencies": {
     "bullmq": "^5.7.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "ioredis": "^5.4.1",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "prom-client": "^15.1.3"
   }
 }
