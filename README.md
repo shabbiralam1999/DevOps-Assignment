@@ -125,3 +125,32 @@ Typical causes: readiness failing because Postgres is down, a Service selector n
 ### Evolving into microservices
 
 The Ingress already acts as a lightweight gateway routing by path prefix. Splitting the backend into `users-service`, `orders-service` and so on means adding Deployments/ClusterIP Services and path rules (`/api/users`, `/api/orders`); DNS, probes and the Ingress pattern stay the same. Next steps: a dedicated gateway (Kong, Envoy Gateway, Gateway API) for authN/Z, per-route rate limits and tracing; one database per service; asynchronous communication over the queue (BullMQ today, RabbitMQ/Kafka later); and a service mesh for mTLS and retries.
+
+## Task 4: CI/CD and multi-environment deployment
+
+`.github/workflows/ci-cd.yml`
+
+| Branch | Namespace | Ingress host |
+|---|---|---|
+| `master` | `dev` | `node-react.local` |
+| `pre-release/v*` | `preprod` | `preprod.node-react.local` |
+| `release/v*` | `release` | `release.node-react.local` |
+
+Pipeline:
+1. **build-and-test**: install backend and frontend dependencies, `node --check` build validation, backend unit tests (`npm test`), frontend build.
+2. **build-and-push**: build both images, tag `<branch>-<short-sha>` (slashes become dashes) plus `<namespace>-latest`, push to GHCR on branch pushes. Pull requests run steps 1 and 2 without pushing.
+3. **deploy**: patch a copy of `k8s/` with the new image tags, the target namespace, a per-environment PV name and the environment's Ingress host, then `kubectl apply` and wait for `rollout status`.
+
+Environment differences handled by the pipeline: the target namespace is created first; the dev-only Namespace manifest, placeholder Secret and fixed NodePort are not applied outside `dev`; the PersistentVolume is renamed per environment (PVs are cluster-scoped); Ingress hosts differ (nginx rejects the same host and path in two namespaces).
+
+**How CI secrets are stored and used**
+- Registry: the built-in `GITHUB_TOKEN` (short-lived, scoped to the repo and run) logs in to GHCR. No long-lived registry credential exists.
+- Cluster access: the kubeconfig is stored base64-encoded as the Actions secret `KUBECONFIG_B64`, ideally per GitHub Environment and backed by a service account limited to that namespace. The deploy job writes it to `~/.kube/config` with mode 600; it is never echoed. If it is not set (this assessment is local-only, a hosted runner cannot reach a laptop cluster) the kubectl steps are skipped with a notice and the run stays green.
+- App credentials: `k8s/app-secrets.yaml` only holds dev placeholders and is applied to `dev` only. For `preprod` and `release` the pipeline creates `app-secrets` from the `DB_USER` and `DB_PASSWORD` secrets of the matching GitHub Environment and fails with a clear error if they are missing. Use URL-safe characters (they end up in connection URLs). In production, Sealed Secrets or External Secrets would replace this.
+
+One-time GitHub setup: Settings, Environments, create `dev`, `preprod`, `release`; add `KUBECONFIG_B64` (and `DB_USER`, `DB_PASSWORD` for the last two); optionally require reviewers on `release`. A cluster that pulls from GHCR needs the packages to be public or an image pull secret.
+
+**Rollback strategy**
+- Automatic: if a rollout does not become healthy, the last deploy step runs `kubectl rollout undo` on the deployments.
+- Manual, fast: Actions, CI/CD, Run workflow, enter the namespace (the `rollback` job), or `kubectl -n <ns> rollout undo deployment/backend [--to-revision=N]`; `kubectl rollout history` lists revisions.
+- Precise: every image tag is immutable (`<branch>-<sha>`), so re-running the pipeline on a previous commit redeploys exactly that known-good image, without depending on an old ReplicaSet still existing.
