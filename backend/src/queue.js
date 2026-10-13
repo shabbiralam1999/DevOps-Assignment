@@ -1,7 +1,7 @@
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 
-const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
+export const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
   maxRetriesPerRequest: null,
 });
 
@@ -12,4 +12,10 @@ export async function enqueueItemCreated(item) {
     removeOnComplete: 100,
     removeOnFail: 100,
   });
+}
+
+// Lets tests and graceful shutdown release the Redis connection.
+export async function closeQueue() {
+  await itemQueue.close();
+  connection.disconnect();
 }
