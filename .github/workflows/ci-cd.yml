@@ -3,20 +3,17 @@ name: CI/CD
 on:
   push:
     branches:
-      - main
       - master
       - "pre-release/v*"
       - "release/v*"
   pull_request:
     branches:
-      - main
       - master
   workflow_dispatch:
     inputs:
       rollback_namespace:
-        description: "Namespace to roll back (leave empty to run CI/build only)"
+        description: "Namespace to roll back (leave empty to skip)"
         required: false
-        type: string
 
 permissions:
   contents: read
@@ -28,7 +25,7 @@ env:
 jobs:
   # 1. install, validate, test, build
   build-and-test:
-    if: github.event_name != 'workflow_dispatch' || inputs.rollback_namespace == ''
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,7 +62,7 @@ jobs:
 
   # 2. build both images; push only on branch pushes (pull requests just validate the build)
   build-and-push:
-    if: github.event_name != 'workflow_dispatch' || inputs.rollback_namespace == ''
+    if: github.event_name != 'workflow_dispatch'
     needs: build-and-test
     runs-on: ubuntu-latest
     outputs:
@@ -90,7 +87,7 @@ jobs:
           echo "image_frontend=${REGISTRY}/${REPO}-frontend" >> "$GITHUB_OUTPUT"
 
           case "${GITHUB_REF_NAME}" in
-            main|master) echo "namespace=dev" >> "$GITHUB_OUTPUT" ;;
+            master) echo "namespace=dev" >> "$GITHUB_OUTPUT" ;;
             pre-release/v*) echo "namespace=preprod" >> "$GITHUB_OUTPUT" ;;
             release/v*) echo "namespace=release" >> "$GITHUB_OUTPUT" ;;
           esac
