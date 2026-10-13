@@ -1,0 +1,45 @@
+# OpenSearch in single-node dev mode (security plugin disabled: internal-only, dev only)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search
+  namespace: dev
+  labels: { app: search }
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: search }
+  template:
+    metadata:
+      labels: { app: search, tier: data }
+    spec:
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.15.0
+          ports:
+            - containerPort: 9200
+          env:
+            - { name: discovery.type, value: single-node }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
+            - { name: DISABLE_INSTALL_DEMO_CONFIG, value: "true" }
+            - { name: bootstrap.memory_lock, value: "false" }
+            - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
+          readinessProbe:
+            httpGet: { path: "/_cluster/health?local=true", port: 9200 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket: { port: 9200 }
+            initialDelaySeconds: 90
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 200m, memory: 1Gi }
+            limits: { memory: 1536Mi }
+          volumeMounts:
+            - { name: data, mountPath: /usr/share/opensearch/data }
+      volumes:
+        - name: data
+          emptyDir: {}

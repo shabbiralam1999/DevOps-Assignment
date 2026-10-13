@@ -1,0 +1,26 @@
+# BullMQ worker: same image as the API, different command; consumes "item-events" jobs from Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bullmq-worker
+  namespace: dev
+  labels: { app: bullmq-worker }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: bullmq-worker }
+  template:
+    metadata:
+      labels: { app: bullmq-worker, tier: worker }
+    spec:
+      containers:
+        - name: worker
+          image: ghcr.io/shabbiralam1999/node-react-postgres-platform-assessment-backend:dev
+          imagePullPolicy: IfNotPresent
+          command: ["node", "src/worker.js"]
+          env:
+            - name: REDIS_URL
+              valueFrom: { configMapKeyRef: { name: app-config, key: REDIS_URL } }
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { memory: 256Mi }
