@@ -1,0 +1,41 @@
+# Two Ingress objects on one host so rate limiting only applies to the API, not the static frontend.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: dev
+  annotations:
+    # rate limiting per client IP: 20 req/s, bursts up to 5x, max 50 concurrent connections
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: node-react.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port: { number: 4000 }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-ingress
+  namespace: dev
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: node-react.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port: { number: 80 }
