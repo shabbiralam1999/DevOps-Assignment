@@ -6,20 +6,26 @@ on:
       - master
       - "pre-release/v*"
       - "release/v*"
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       rollback_namespace:
         description: "Namespace to roll back (leave empty to skip)"
         required: false
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   REGISTRY: ghcr.io
-  IMAGE_BACKEND: ${{ github.repository }}-backend
-  IMAGE_FRONTEND: ${{ github.repository }}-frontend
 
 jobs:
+  # 1. install, validate, test, build
   build-and-test:
-    if: github.event_name == 'push'
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +33,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
 
       - name: Install backend dependencies
         working-directory: backend
@@ -38,34 +48,43 @@ jobs:
 
       - name: Backend build validation
         working-directory: backend
-        run: node --check src/index.js
+        run: |
+          node --check src/index.js
+          node --check src/worker.js
 
       - name: Backend tests
         working-directory: backend
-        run: npm test --if-present
+        run: npm test
 
       - name: Frontend build
         working-directory: frontend
         run: npm run build
 
+  # 2. build both images; push only on branch pushes (pull requests just validate the build)
   build-and-push:
-    if: github.event_name == 'push'
+    if: github.event_name != 'workflow_dispatch'
     needs: build-and-test
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       namespace: ${{ steps.meta.outputs.namespace }}
+      image_backend: ${{ steps.meta.outputs.image_backend }}
+      image_frontend: ${{ steps.meta.outputs.image_frontend }}
     steps:
       - uses: actions/checkout@v4
 
-      # Tag = <branch-name>-<short-sha> so every image is traceable back to
-      # the exact commit and branch that produced it.
-      - name: Compute image tag and target namespace
+      # Tag = <branch-name>-<short-sha> so every image traces back to the commit and branch
+      # that produced it. Image names must be lowercase for GHCR.
+      - name: Compute image tag, image names and target namespace
         id: meta
         run: |
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
-          SAFE_BRANCH=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')
+          SAFE_BRANCH=$(echo "${BRANCH}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           echo "tag=${SAFE_BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_backend=${REGISTRY}/${REPO}-backend" >> "$GITHUB_OUTPUT"
+          echo "image_frontend=${REGISTRY}/${REPO}-frontend" >> "$GITHUB_OUTPUT"
 
           case "${GITHUB_REF_NAME}" in
             master) echo "namespace=dev" >> "$GITHUB_OUTPUT" ;;
@@ -74,87 +93,154 @@ jobs:
           esac
 
       # GITHUB_TOKEN is short-lived and scoped to this repo/run only - no
-      # long-lived registry credentials are stored anywhere in the repo.
+      # long-lived registry credentials are stored anywhere.
       - name: Log in to GHCR
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push backend image
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (push on branch pushes)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.backend
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:${{ steps.meta.outputs.namespace }}-latest
+            ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.namespace || 'pr' }}-latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
 
-      - name: Build and push frontend image
+      - name: Build frontend image (push on branch pushes)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.frontend
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.namespace }}-latest
+            ${{ steps.meta.outputs.image_frontend }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image_frontend }}:${{ steps.meta.outputs.namespace || 'pr' }}-latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
 
+  # 3. deploy to the namespace that matches the branch
   deploy:
     if: github.event_name == 'push'
     needs: build-and-push
     runs-on: ubuntu-latest
+    # GitHub Environment per namespace (dev / preprod / release): its secrets are scoped to it,
+    # and reviewers can be required on `release`.
     environment: ${{ needs.build-and-push.outputs.namespace }}
+    env:
+      # KUBECONFIG_B64 is a base64-encoded kubeconfig kept only as an encrypted Actions secret.
+      # This assessment is local-only, so without it the kubectl steps are skipped (not failed).
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
+      TAG: ${{ needs.build-and-push.outputs.tag }}
+      IMAGE_BACKEND: ${{ needs.build-and-push.outputs.image_backend }}
+      IMAGE_FRONTEND: ${{ needs.build-and-push.outputs.image_frontend }}
     steps:
       - uses: actions/checkout@v4
 
-      # KUBECONFIG_B64 is a base64-encoded kubeconfig stored as an encrypted
-      # GitHub Actions secret, scoped to a service account with access to
-      # only this cluster/namespace set - never printed or written to logs.
+      - name: Skip notice
+        if: env.KUBECONFIG_B64 == ''
+        run: echo "::notice::KUBECONFIG_B64 is not set for environment '${NAMESPACE}' - images were built and pushed, kubectl deploy skipped."
+
       - name: Configure kubeconfig
+        if: env.KUBECONFIG_B64 != ''
         run: |
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
-      - name: Deploy manifests to ${{ needs.build-and-push.outputs.namespace }}
-        env:
-          NAMESPACE: ${{ needs.build-and-push.outputs.namespace }}
-          TAG: ${{ needs.build-and-push.outputs.tag }}
+      - name: Prepare manifests for ${{ needs.build-and-push.outputs.namespace }}
+        if: env.KUBECONFIG_B64 != ''
         run: |
           set -euo pipefail
+          case "${NAMESPACE}" in
+            dev)     HOST=node-react.local ;;
+            preprod) HOST=preprod.node-react.local ;;
+            release) HOST=release.node-react.local ;;
+          esac
           mkdir -p /tmp/manifests
           cp k8s/*.yaml /tmp/manifests/
 
-          # Point the deployments at the image just built and pushed.
-          sed -i "s#ghcr.io/.*-backend:.*#${REGISTRY}/${IMAGE_BACKEND}:${TAG}#" /tmp/manifests/backend-deployment.yaml
-          sed -i "s#ghcr.io/.*-backend:.*#${REGISTRY}/${IMAGE_BACKEND}:${TAG}#" /tmp/manifests/bullmq-worker-deployment.yaml
-          sed -i "s#ghcr.io/.*-frontend:.*#${REGISTRY}/${IMAGE_FRONTEND}:${TAG}#" /tmp/manifests/frontend-deployment.yaml
+          # Point the deployments at the images just built and pushed.
+          sed -i "s#ghcr.io/.*-backend:.*#${IMAGE_BACKEND}:${TAG}#" /tmp/manifests/backend-deployment.yaml /tmp/manifests/bullmq-worker-deployment.yaml
+          sed -i "s#ghcr.io/.*-frontend:.*#${IMAGE_FRONTEND}:${TAG}#" /tmp/manifests/frontend-deployment.yaml
 
-          # Re-target every manifest at the environment-specific namespace.
+          # Re-target everything at the environment: namespace, per-environment PV, Ingress host.
           sed -i "s/namespace: dev/namespace: ${NAMESPACE}/" /tmp/manifests/*.yaml
+          sed -i "s/postgres-pv-dev/postgres-pv-${NAMESPACE}/g; s#/data/postgres-dev#/data/postgres-${NAMESPACE}#g" /tmp/manifests/postgres-pv.yaml /tmp/manifests/postgres-pvc.yaml
+          sed -i "s/node-react\.local/${HOST}/g" /tmp/manifests/ingress-dev.yaml
 
-          kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+          if [ "${NAMESPACE}" != "dev" ]; then
+            # dev-only extras: the Namespace manifest, the placeholder Secret, and the fixed NodePort
+            # (a NodePort can only be allocated once per cluster)
+            rm /tmp/manifests/namespace-dev.yaml /tmp/manifests/app-secrets.yaml
+            sed -i '/nodePort:/d' /tmp/manifests/frontend-service.yaml
+          fi
+
+      - name: Create namespace
+        if: env.KUBECONFIG_B64 != ''
+        run: kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+      # preprod/release credentials come from the GitHub Environment's secrets, never from the repo.
+      - name: Provision app-secrets (preprod/release)
+        if: env.KUBECONFIG_B64 != '' && env.NAMESPACE != 'dev'
+        env:
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ]; then
+            echo "::error::DB_USER and DB_PASSWORD must be set as secrets of the '${NAMESPACE}' GitHub Environment (URL-safe characters)"
+            exit 1
+          fi
+          kubectl -n "${NAMESPACE}" create secret generic app-secrets \
+            --from-literal=DB_USER="$DB_USER" --from-literal=DB_PASSWORD="$DB_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy manifests to ${{ needs.build-and-push.outputs.namespace }}
+        if: env.KUBECONFIG_B64 != ''
+        run: |
+          set -euo pipefail
           kubectl apply -n "${NAMESPACE}" -f /tmp/manifests/
-          kubectl rollout status -n "${NAMESPACE}" deployment/backend --timeout=120s
-          kubectl rollout status -n "${NAMESPACE}" deployment/frontend --timeout=120s
+          for d in postgres redis backend frontend bullmq-worker; do
+            kubectl rollout status -n "${NAMESPACE}" deployment/$d --timeout=180s
+          done
 
+      # Safe deployment: a failed rollout is undone automatically.
+      - name: Roll back on failure
+        if: failure() && env.KUBECONFIG_B64 != ''
+        run: |
+          for d in backend frontend bullmq-worker; do
+            kubectl rollout undo -n "${NAMESPACE}" deployment/$d || true
+          done
+
+  # Manual rollback: Actions -> CI/CD -> Run workflow -> enter a namespace
   rollback:
     if: github.event_name == 'workflow_dispatch' && inputs.rollback_namespace != ''
     runs-on: ubuntu-latest
+    env:
+      KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+      NAMESPACE: ${{ inputs.rollback_namespace }}
     steps:
       - name: Configure kubeconfig
         run: |
+          if [ -z "$KUBECONFIG_B64" ]; then echo "::error::KUBECONFIG_B64 secret is not set"; exit 1; fi
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
-      # Fast path: undo the last rollout. The slower/more precise path is
-      # re-running this workflow with a previous commit checked out, which
-      # rebuilds and redeploys that exact previous image tag.
+      # Fast path: undo the last rollout. The precise path is to re-run the pipeline on a previous
+      # commit, which redeploys that exact immutable image tag.
       - name: Roll back last deployment
-        env:
-          NAMESPACE: ${{ inputs.rollback_namespace }}
         run: |
-          kubectl rollout undo -n "${NAMESPACE}" deployment/backend
-          kubectl rollout undo -n "${NAMESPACE}" deployment/frontend
+          for d in backend frontend bullmq-worker; do
+            kubectl rollout undo -n "${NAMESPACE}" deployment/$d
+          done
