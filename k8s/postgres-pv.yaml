@@ -1,0 +1,15 @@
+# Static hostPath volume for local clusters (kind/minikube). The name and path carry the
+# environment so the pipeline can create one per namespace (PVs are cluster-scoped).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv-dev
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes: [ReadWriteOnce]
+  storageClassName: manual
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: /data/postgres-dev
+    type: DirectoryOrCreate

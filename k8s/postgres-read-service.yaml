@@ -1,0 +1,12 @@
+# Simulated read-replica endpoint. Same pod here; in production this selects the replica pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-read-service
+  namespace: dev
+spec:
+  type: ClusterIP
+  selector: { app: postgres }
+  ports:
+    - port: 5432
+      targetPort: 5432

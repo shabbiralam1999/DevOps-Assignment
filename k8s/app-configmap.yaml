@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: dev
+data:
+  PORT: "4000"
+  # short Service names resolve inside the same namespace, so the same manifests work in preprod/release
+  DB_HOST: postgres-service
+  DB_READ_HOST: postgres-read-service
+  DB_PORT: "5432"
+  DB_NAME: appdb
+  REDIS_URL: redis://redis-service:6379
+  SEARCH_URL: http://search-service:9200
