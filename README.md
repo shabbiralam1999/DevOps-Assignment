@@ -173,3 +173,49 @@ Quick checks (Compose): `curl localhost:4000/api/health/redis`, `curl localhost:
 **Where routing logic lives.** Here it is explicit in application code (`write()` vs `read()`). The alternative is a DB proxy (PgBouncer, Pgpool-II, a managed reader endpoint) that makes routing transparent to the app: simpler code, but one more component to operate and one more hop of latency.
 
 **Replication lag.** A replica can be milliseconds to seconds behind the primary. Operations that must always hit the writer: all writes; reads that must see data just written (read-your-writes, for example re-fetching a record right after creating it); reads inside a transaction that also writes; reads that drive a write decision (uniqueness checks, balance checks, locks, idempotency keys); and auth/session reads right after login or a password change. Lists, dashboards and search tolerate seconds-old data and can use replicas. Mitigations: monitor lag, fall back to the primary when lag is high, or pin a user's reads to the primary for a few seconds after they write.
+
+## Task 6: Observability, scaling and rate limiting
+
+```bash
+./scripts/setup-observability.sh
+kubectl -n monitoring port-forward svc/grafana 3000:3000        # admin / admin-dev-only (dev credentials)
+./scripts/load-test.sh                                         # generate traffic for the dashboard and the HPA
+kubectl -n dev get hpa -w
+```
+
+**Metrics (Prometheus + Grafana).** The backend exposes `/metrics` (default Node.js metrics, `http_requests_total`, `http_request_duration_seconds`). It is not routed by the Ingress (only `/api/*` is); Prometheus scrapes the pods in `dev` directly through the `prometheus.io/*` annotations. CPU and memory come from the kubelet's cAdvisor endpoint, and the replica count is `count(up{job="backend"} == 1)`. Grafana is provisioned with Prometheus and Loki data sources and a "Backend overview" dashboard: backend CPU, backend memory, request rate, error rate (5xx req/s and %), backend replicas over time, and p95 latency.
+
+**Alerts I would configure** (rules in `observability/prometheus.yaml`):
+- **High error rate** (5xx over 5% for 5 min): the most direct sign that users are failing, independent of load.
+- **High p95 latency** (over 500 ms for 10 min): catches slow queries or a struggling dependency before errors appear.
+- **High CPU / HPA at max replicas** (over 80% of the limit for 10 min): the autoscaler has no headroom left; queueing and latency follow.
+- **Fewer than 2 healthy backend pods**: redundancy is lost, one failure away from an outage.
+- With more time: pod restarts and OOM kills, memory near the limit, Postgres connections and replication lag, queue depth and failed jobs, disk usage on the volume.
+
+**Logging (Fluent Bit + Loki).** Fluent Bit runs as a DaemonSet (one per node, so it sees every pod's logs on that node), tails the container logs of the `dev` namespace, adds Kubernetes metadata and ships them to Loki. The backend writes one JSON line per request, so in Grafana, Explore, Loki:
+
+```
+{job="backend"}
+{namespace="dev", app="backend"} | json | status >= 500
+{job="bullmq-worker"} |= "processing"
+```
+Check the collector with `kubectl -n monitoring logs ds/fluent-bit`.
+
+**HPA** (`k8s/hpa-backend.yaml`): 2 to 6 replicas, scale on 70% average CPU or 80% average memory (relative to the pod requests), 120 s scale-down stabilisation. It needs metrics-server, which `setup-kind.sh` installs. It lives in `k8s/` so the pipeline deploys it with the app.
+
+**Rate limiting** (Ingress annotations on the API route only): `limit-rps: 20` per client IP, `limit-burst-multiplier: 5` (bursts up to 100), `limit-connections: 50`. A person using the UI makes a handful of requests per second, so 20 rps per IP never affects normal use but stops a single client or script from saturating the backend; the burst allowance absorbs page loads that fire several calls at once. The static frontend is not limited. ingress-nginx answers excess requests with 503 by default (`limit-req-status-code: "429"` changes that). Limiting at the edge protects the pods before they spend any CPU. Limits should be tuned from real traffic.
+
+## Design decisions, trade-offs, and what I would do with more time
+
+- **Plain manifests, applied with `kubectl apply -f k8s/`**, exactly as the provided pipeline expects; the pipeline rewrites namespace, image tags and host with `sed`. Kustomize or Helm would be the next step for larger per-environment differences.
+- **Plain manifests for observability** instead of Helm charts, so every piece is visible and reviewable; `kube-prometheus-stack` would be the production choice.
+- **API URL baked in at build time** (as the provided frontend does): simple and fast, but one image per API URL. Runtime configuration (an `env-config.js` written at container start) would give one image for every environment.
+- **One Postgres pod behind a "primary" and a "replica" endpoint**: shows the configuration and code split without the cost of real replication. A StatefulSet or operator (CloudNativePG) is the real answer.
+- **hostPath PV** is simple for local clusters but not for production; use a real StorageClass there.
+- **Images are loaded into kind** (`kind load docker-image`) so no registry is needed locally; CI pushes to GHCR.
+- **Changes I made to the provided code:** `db.js` no longer has a default password and fails fast without credentials; `index.js` was split into `app.js` (routes) and `index.js` (start-up) so the app can be tested; added `metrics.js` (Prometheus metrics and JSON request logs), unit tests (the old test script ended in `|| true`, which hid failures) and the pipeline fixes described in Task 4.
+- **With more time:** Alertmanager with real notifications, kube-state-metrics, tracing (OpenTelemetry), TLS with cert-manager, Sealed Secrets, a real Postgres replica, integration tests on kind in CI, image scanning (Trivy), and a PodDisruptionBudget plus anti-affinity for the backend.
+
+## Evidence (`docs/`)
+
+`docs/EVIDENCE.md` lists the screenshots to capture: `kubectl get all -n dev`, the app at http://node-react.local, Grafana dashboards, Loki log queries, and a passing GitHub Actions run.
