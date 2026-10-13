@@ -1,0 +1,16 @@
+# ---- stage 1: production dependencies only ----
+FROM node:20-alpine AS deps
+WORKDIR /app
+COPY backend/package.json backend/package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# ---- stage 2: small runtime image (no build tools, no tests, non-root) ----
+FROM node:20-alpine AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY backend/package.json ./
+COPY backend/src ./src
+USER node
+EXPOSE 4000
+CMD ["node", "src/index.js"]

@@ -1,0 +1,16 @@
+# ---- stage 1: build the static bundle ----
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+# Baked in at build time by Vite. Empty => the app falls back to "/api" (same-origin via Ingress).
+ARG VITE_API_BASE_URL=""
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+RUN npm run build
+
+# ---- stage 2: nginx serves only the compiled files ----
+FROM nginx:1.27-alpine AS runtime
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80

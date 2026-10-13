@@ -2,15 +2,14 @@ import pg from "pg";
 
 const { Pool } = pg;
 
+// Credentials are never hardcoded: they come from the environment (Secret in k8s,
+// .env / compose environment locally). Either DB_WRITE_URL or the DB_* parts are required.
 function buildConnectionString() {
-  const {
-    DB_USER = "appuser",
-    DB_PASSWORD = "apppass",
-    DB_HOST = "localhost",
-    DB_PORT = "5432",
-    DB_NAME = "appdb",
-  } = process.env;
-  return `postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}`;
+  const { DB_USER, DB_PASSWORD, DB_HOST = "localhost", DB_PORT = "5432", DB_NAME } = process.env;
+  if (!DB_USER || !DB_PASSWORD || !DB_NAME) {
+    throw new Error("Set DB_WRITE_URL, or DB_USER, DB_PASSWORD and DB_NAME (see backend/.env.example)");
+  }
+  return `postgres://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${DB_HOST}:${DB_PORT}/${DB_NAME}`;
 }
 
 // Simulated read/write DB cluster: two pools pointed at different env vars.
