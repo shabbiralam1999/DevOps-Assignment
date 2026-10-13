@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: prometheus, namespace: monitoring }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: prometheus }
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/proxy, nodes/metrics, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/metrics, /metrics/cadvisor]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: prometheus }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: prometheus }
+subjects:
+  - { kind: ServiceAccount, name: prometheus, namespace: monitoring }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: prometheus-config, namespace: monitoring }
+data:
+  alerts.yml: |
+    groups:
+      - name: backend
+        rules:
+          - alert: BackendHighErrorRate
+            expr: sum(rate(http_requests_total{namespace="dev",status=~"5.."}[5m])) / sum(rate(http_requests_total{namespace="dev"}[5m])) > 0.05
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "More than 5% of backend requests are failing" }
+          - alert: BackendHighLatencyP95
+            expr: histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace="dev"}[5m]))) > 0.5
+            for: 10m
+            labels: { severity: warning }
+            annotations: { summary: "Backend p95 latency above 500ms" }
+          - alert: BackendHighCPU
+            expr: sum(rate(container_cpu_usage_seconds_total{namespace="dev",pod=~"backend-.*",container="backend"}[5m])) / (0.5 * count(up{job="backend"} == 1)) > 0.8
+            for: 10m
+            labels: { severity: warning }
+            annotations: { summary: "Backend CPU above 80% of limit (HPA may be maxed out)" }
+          - alert: BackendPodDown
+            expr: count(up{job="backend"} == 1) < 2
+            for: 2m
+            labels: { severity: critical }
+            annotations: { summary: "Fewer than 2 healthy backend pods" }
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    rule_files:
+      - /etc/prometheus/alerts.yml
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # backend pods in dev, discovered through the pod annotations
+      - job_name: backend
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: { names: [dev] }
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+      # per-container CPU / memory via the kubelet's cAdvisor endpoint
+      - job_name: cadvisor
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: prometheus, namespace: monitoring, labels: { app: prometheus } }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.retention.time=24h
+          ports:
+            - containerPort: 9090
+          readinessProbe:
+            httpGet: { path: /-/ready, port: 9090 }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: prometheus, namespace: monitoring }
+spec:
+  selector: { app: prometheus }
+  ports:
+    - { port: 9090, targetPort: 9090 }
