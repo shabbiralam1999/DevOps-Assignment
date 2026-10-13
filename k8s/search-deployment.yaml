@@ -25,6 +25,7 @@ spec:
             - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
             - { name: DISABLE_INSTALL_DEMO_CONFIG, value: "true" }
             - { name: bootstrap.memory_lock, value: "false" }
+            - { name: node.store.allow_mmap, value: "false" }   # no vm.max_map_count node setting needed (dev only)
             - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
           readinessProbe:
             httpGet: { path: "/_cluster/health?local=true", port: 9200 }

@@ -35,6 +35,15 @@ After `setup-kind.sh`, add `127.0.0.1 node-react.local` to your hosts file (`/et
 
 ---
 
+## Troubleshooting
+
+- **OpenSearch does not start / is OOM-killed:** it needs about 1.5 GB. The configs set `node.store.allow_mmap=false`, so the Linux `vm.max_map_count` host setting is not required; if you still see a `max virtual memory areas` error, run `sudo sysctl -w vm.max_map_count=262144`. To work without search, `docker compose up --build postgres backend frontend redis worker`.
+- **Port already in use:** Compose publishes 8080 and 4000; kind publishes 80, 443 and 30080.
+- **`node-react.local` does not resolve:** add `127.0.0.1 node-react.local` to the hosts file, or test with `curl -H "Host: node-react.local" http://localhost/api/health`.
+- **Pods stuck in `ImagePullBackOff` on kind:** the images must be loaded with `kind load docker-image` (the setup script does this); do not apply the manifests before running it.
+
+---
+
 ## Task 1: Local Docker Compose
 
 ```bash
